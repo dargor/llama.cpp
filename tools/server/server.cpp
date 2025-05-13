@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <iostream>
 #include "utils.hpp"
 
 #include "arg.h"
@@ -3558,6 +3560,14 @@ inline void signal_handler(int signal) {
 }
 
 int main(int argc, char ** argv) {
+    // Set stdout and stderr to unbuffered mode
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    // Ensure C++ streams are synchronized with C streams and unbuffered
+    std::ios::sync_with_stdio(true);
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
+
     // own arguments required by this example
     common_params params;
 
