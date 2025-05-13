@@ -1726,92 +1726,152 @@ struct server_response {
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task) {
         SRV_DBG("add task %d to waiting list. current waiting = %d (before add)\n", id_task, (int) waiting_task_ids.size());
+        fprintf(stderr, "[RERANK_DEBUG] server_response::add_waiting_task_id: adding task_id=%d to waiting list\n", id_task);
 
         std::unique_lock<std::mutex> lock(mutex_results);
         waiting_task_ids.insert(id_task);
+        fprintf(stderr, "[RERANK_DEBUG] server_response::add_waiting_task_id: task_id=%d added, waiting_task_ids size now=%d\n", 
+                id_task, (int)waiting_task_ids.size());
     }
 
     void add_waiting_tasks(const std::vector<server_task> & tasks) {
         std::unique_lock<std::mutex> lock(mutex_results);
+        fprintf(stderr, "[RERANK_DEBUG] server_response::add_waiting_tasks: adding %zu tasks\n", tasks.size());
 
         for (const auto & task : tasks) {
             SRV_DBG("add task %d to waiting list. current waiting = %d (before add)\n", task.id, (int) waiting_task_ids.size());
             waiting_task_ids.insert(task.id);
+            fprintf(stderr, "[RERANK_DEBUG] server_response::add_waiting_tasks: added task_id=%d\n", task.id);
         }
+    
+        fprintf(stderr, "[RERANK_DEBUG] server_response::add_waiting_tasks: now waiting for %zu tasks total\n", waiting_task_ids.size());
     }
 
     // when the request is finished, we can remove task associated with it
     void remove_waiting_task_id(int id_task) {
         SRV_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
+        fprintf(stderr, "[RERANK_DEBUG] server_response::remove_waiting_task_id: removing task_id=%d from waiting list\n", id_task);
 
         std::unique_lock<std::mutex> lock(mutex_results);
-        waiting_task_ids.erase(id_task);
+        size_t num_erased = waiting_task_ids.erase(id_task);
+        fprintf(stderr, "[RERANK_DEBUG] server_response::remove_waiting_task_id: erased=%zu entries for task_id=%d\n", num_erased, id_task);
+        
         // make sure to clean up all pending results
+        size_t before_size = queue_results.size();
         queue_results.erase(
             std::remove_if(queue_results.begin(), queue_results.end(), [id_task](const server_task_result_ptr & res) {
                 return res->id == id_task;
             }),
             queue_results.end());
+        size_t removed = before_size - queue_results.size();
+        fprintf(stderr, "[RERANK_DEBUG] server_response::remove_waiting_task_id: removed %zu results for task_id=%d\n", 
+                removed, id_task);
     }
 
     void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {
+        fprintf(stderr, "[RERANK_DEBUG] remove_waiting_task_ids: removing %zu tasks\n", id_tasks.size());
         std::unique_lock<std::mutex> lock(mutex_results);
 
         for (const auto & id_task : id_tasks) {
             SRV_DBG("remove task %d from waiting list. current waiting = %d (before remove)\n", id_task, (int) waiting_task_ids.size());
-            waiting_task_ids.erase(id_task);
+            fprintf(stderr, "[RERANK_DEBUG] remove_waiting_task_ids: removing task_id=%d from waiting list\n", id_task);
+            size_t num_erased = waiting_task_ids.erase(id_task);
+            fprintf(stderr, "[RERANK_DEBUG] remove_waiting_task_ids: erased=%zu entries for task_id=%d\n", num_erased, id_task);
         }
+        
+        // Log how many results might be affected
+        int rerank_results = 0;
+        for (const auto& result : queue_results) {
+            if (dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr) {
+                rerank_results++;
+            }
+        }
+        fprintf(stderr, "[RERANK_DEBUG] remove_waiting_task_ids: %d rerank results still in results queue\n", rerank_results);
     }
 
     // This function blocks the thread until there is a response for one of the id_tasks
     server_task_result_ptr recv(const std::unordered_set<int> & id_tasks) {
+        fprintf(stderr, "[RERANK_DEBUG] server_response::recv: waiting for %zu tasks\n", id_tasks.size());
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
             condition_results.wait(lock, [&]{
                 if (!running) {
                     SRV_DBG("%s : queue result stop\n", __func__);
+                    fprintf(stderr, "[RERANK_DEBUG] server_response::recv: service not running, terminating\n");
                     std::terminate(); // we cannot return here since the caller is HTTP code
                 }
                 return !queue_results.empty();
             });
 
+            fprintf(stderr, "[RERANK_DEBUG] server_response::recv: queue has %zu results\n", queue_results.size());
             for (size_t i = 0; i < queue_results.size(); i++) {
                 if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
                     server_task_result_ptr res = std::move(queue_results[i]);
                     queue_results.erase(queue_results.begin() + i);
+                    fprintf(stderr, "[RERANK_DEBUG] server_response::recv: found result for task_id=%d\n", res->id);
+                    
+                    // Check if it's a rerank result
+                    if (dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr) {
+                        auto rerank_res = dynamic_cast<server_task_result_rerank*>(res.get());
+                        fprintf(stderr, "[RERANK_DEBUG] server_response::recv: rerank result score=%f\n", rerank_res->score);
+                    }
+                    
                     return res;
                 }
             }
+            fprintf(stderr, "[RERANK_DEBUG] server_response::recv: no result found for any requested task, continuing to wait\n");
         }
 
-        // should never reach here
+        GGML_UNREACHABLE();
     }
 
     // same as recv(), but have timeout in seconds
     // if timeout is reached, nullptr is returned
-    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout_s) {
+        fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: waiting for any of %zu tasks with timeout=%ds\n", 
+                id_tasks.size(), timeout_s);
+        
+        // Print the task IDs we're waiting for
+        fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: waiting for task_ids: ");
+        for (const auto & id : id_tasks) {
+            fprintf(stderr, "%d ", id);
+        }
+        fprintf(stderr, "\n");
+        
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_results);
-
+            
+            fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: checking %zu results in queue\n", queue_results.size());
             for (int i = 0; i < (int) queue_results.size(); i++) {
                 if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
                     server_task_result_ptr res = std::move(queue_results[i]);
                     queue_results.erase(queue_results.begin() + i);
+                    fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: found result for task_id=%d\n", res->id);
+                    
+                    // Check if it's a rerank result
+                    if (dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr) {
+                        auto rerank_res = dynamic_cast<server_task_result_rerank*>(res.get());
+                        fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: rerank result score=%f\n", rerank_res->score);
+                    }
+                    
                     return res;
                 }
             }
 
-            std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
             if (!running) {
                 SRV_DBG("%s : queue result stop\n", __func__);
+                fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: service not running, terminating\n");
                 std::terminate(); // we cannot return here since the caller is HTTP code
             }
-            if (cr_res == std::cv_status::timeout) {
+
+            fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: no result found, waiting up to %ds\n", timeout_s);
+            auto status = condition_results.wait_for(lock, std::chrono::seconds(timeout_s));
+            if (status == std::cv_status::timeout && timeout_s > 0) {
+                fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: timeout reached after %ds\n", timeout_s);
                 return nullptr;
             }
+            fprintf(stderr, "[RERANK_DEBUG] recv_with_timeout: condition variable notified, checking results again\n");
         }
-
-        // should never reach here
     }
 
     // single-task version of recv()
@@ -1823,16 +1883,42 @@ struct server_response {
     // Send a new result to a waiting id_task
     void send(server_task_result_ptr && result) {
         SRV_DBG("sending result for task id = %d\n", result->id);
+        
+        // Check if it's a rerank result
+        if (dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr) {
+            auto rerank_res = dynamic_cast<server_task_result_rerank*>(result.get());
+            fprintf(stderr, "[RERANK_DEBUG] server_response::send: received rerank result for task_id=%d, score=%f\n", 
+                    result->id, rerank_res->score);
+        }
 
         std::unique_lock<std::mutex> lock(mutex_results);
+        
+        // Debug output all waiting task IDs
+        fprintf(stderr, "[RERANK_DEBUG] server_response::send: waiting_task_ids contains %zu tasks: ", waiting_task_ids.size());
+        for (const auto & id : waiting_task_ids) {
+            fprintf(stderr, "%d ", id);
+        }
+        fprintf(stderr, "\n");
+        
+        bool found = false;
         for (const auto & id_task : waiting_task_ids) {
             if (result->id == id_task) {
+                found = true;
                 SRV_DBG("task id = %d pushed to result queue\n", result->id);
+                
+                if (dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr) {
+                    fprintf(stderr, "[RERANK_DEBUG] server_response::send: task_id=%d found in waiting_task_ids, adding to queue\n", result->id);
+                }
 
                 queue_results.emplace_back(std::move(result));
                 condition_results.notify_all();
                 return;
             }
+        }
+        
+        // Only reached if task not found
+        if (dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr) {
+            fprintf(stderr, "[RERANK_DEBUG] server_response::send: WARNING! task_id=%d NOT found in waiting_task_ids\n", result->id);
         }
     }
 
@@ -2542,34 +2628,51 @@ struct server_context {
     }
 
     void send_rerank(const server_slot & slot, const llama_batch & batch) {
+        // Custom diagnostic logging for rerank issues (independent of verbosity level)
+        fprintf(stderr, "[RERANK_DEBUG] Starting rerank process for slot_id=%d, task_id=%d\n", slot.id, slot.id_task);
         auto res = std::make_unique<server_task_result_rerank>();
         res->id    = slot.id_task;
         res->index = slot.index;
         res->n_tokens = slot.n_prompt_tokens;
 
+        fprintf(stderr, "[RERANK_DEBUG] Processing %d tokens in batch\n", batch.n_tokens);
+        int tokens_processed = 0;
+        
         for (int i = 0; i < batch.n_tokens; ++i) {
             if (!batch.logits[i] || batch.seq_id[i][0] != slot.id) {
                 continue;
             }
+            
+            fprintf(stderr, "[RERANK_DEBUG] Processing token %d (value=%d) with seq_id=%d\n", 
+                   i, batch.token[i], batch.seq_id[i][0]);
+            tokens_processed++;
 
             const float * embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
             if (embd == NULL) {
+                fprintf(stderr, "[RERANK_DEBUG] First embedding lookup failed, trying by index\n");
                 embd = llama_get_embeddings_ith(ctx, i);
             }
 
             if (embd == NULL) {
                 SLT_ERR(slot, "failed to get embeddings, token = %d, seq_id = %d\n", batch.token[i], batch.seq_id[i][0]);
-
+                fprintf(stderr, "[RERANK_DEBUG] Both embedding lookups failed for token %d\n", i);
+                
                 res->score = -1e6;
                 continue;
             }
 
             res->score = embd[0];
+            fprintf(stderr, "[RERANK_DEBUG] Got embedding score: %f\n", res->score);
         }
 
+        fprintf(stderr, "[RERANK_DEBUG] Processed %d/%d tokens, final score: %f\n", 
+               tokens_processed, batch.n_tokens, res->score);
+        
         SLT_DBG(slot, "sending rerank result, res.score = %f\n", res->score);
 
+        fprintf(stderr, "[RERANK_DEBUG] About to send result to queue\n");
         queue_results.send(std::move(res));
+        fprintf(stderr, "[RERANK_DEBUG] Result sent to queue\n");
     }
 
     //
@@ -2577,10 +2680,12 @@ struct server_context {
     //
 
     void cancel_tasks(const std::unordered_set<int> & id_tasks) {
+        fprintf(stderr, "[RERANK_DEBUG] cancel_tasks: canceling %zu tasks\n", id_tasks.size());
         std::vector<server_task> cancel_tasks;
         cancel_tasks.reserve(id_tasks.size());
         for (const auto & id_task : id_tasks) {
             SRV_WRN("cancel task, id_task = %d\n", id_task);
+            fprintf(stderr, "[RERANK_DEBUG] cancel_tasks: canceling task_id=%d\n", id_task);
 
             server_task task(SERVER_TASK_TYPE_CANCEL);
             task.id_target = id_task;
@@ -2588,7 +2693,9 @@ struct server_context {
             cancel_tasks.push_back(std::move(task));
         }
         // push to beginning of the queue, so it has highest priority
+        fprintf(stderr, "[RERANK_DEBUG] cancel_tasks: posting %zu cancel tasks to queue\n", cancel_tasks.size());
         queue_tasks.post(std::move(cancel_tasks), true);
+        fprintf(stderr, "[RERANK_DEBUG] cancel_tasks: tasks posted to queue\n");
     }
 
     // receive the results from task(s)
@@ -2597,35 +2704,56 @@ struct server_context {
             const std::function<void(std::vector<server_task_result_ptr>&)> & result_handler,
             const std::function<void(json)> & error_handler,
             const std::function<bool()> & is_connection_closed) {
+        fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: started for %zu tasks\n", id_tasks.size());
         std::vector<server_task_result_ptr> results(id_tasks.size());
         for (int i = 0; i < (int)id_tasks.size(); i++) {
+            fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: waiting for result %d/%zu\n", i+1, id_tasks.size());
             server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, HTTP_POLLING_SECONDS);
 
             if (is_connection_closed()) {
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: connection closed, canceling tasks\n");
                 cancel_tasks(id_tasks);
                 return;
             }
 
             if (result == nullptr) {
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: timeout waiting for result, retrying\n");
                 i--; // retry
                 continue;
             }
 
+            fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: received result for task_id=%d\n", result->id);
+            
             if (result->is_error()) {
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: result is an error, canceling tasks\n");
                 error_handler(result->to_json());
                 cancel_tasks(id_tasks);
                 return;
             }
 
+            // Check the result type
+            if (dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr) {
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: result is completion\n");
+            } else if (dynamic_cast<server_task_result_embd*>(result.get()) != nullptr) {
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: result is embedding\n");
+            } else if (dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr) {
+                auto rerank_res = dynamic_cast<server_task_result_rerank*>(result.get());
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: result is rerank with score=%f\n", rerank_res->score);
+            } else {
+                fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: unexpected result type\n");
+            }
+            
             GGML_ASSERT(
                 dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                 || dynamic_cast<server_task_result_embd*>(result.get()) != nullptr
                 || dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr
             );
             const size_t idx = result->get_index();
+            fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: adding result to position %zu\n", idx);
             GGML_ASSERT(idx < results.size() && "index out of range");
             results[idx] = std::move(result);
         }
+        fprintf(stderr, "[RERANK_DEBUG] receive_multi_results: all results received, calling handler\n");
         result_handler(results);
     }
 
@@ -3360,8 +3488,12 @@ struct server_context {
                     }
 
                     if (slot.task_type == SERVER_TASK_TYPE_RERANK) {
+                        fprintf(stderr, "[RERANK_DEBUG] update_slots: about to call send_rerank for slot_id=%d, task_id=%d\n", slot.id, slot.id_task);
+                        
                         send_rerank(slot, batch_view);
+                        fprintf(stderr, "[RERANK_DEBUG] update_slots: send_rerank completed for slot_id=%d, task_id=%d\n", slot.id, slot.id_task);
                         slot.release();
+                        fprintf(stderr, "[RERANK_DEBUG] update_slots: slot released for slot_id=%d, task_id=%d\n", slot.id, slot.id_task);
                         slot.i_batch = -1;
                         continue; // continue loop of slots
                     }
@@ -4498,12 +4630,27 @@ int main(int argc, char ** argv) {
         }
 
         // get the result
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: calling receive_multi_results with %zu task_ids\n", task_ids.size());
+        
+        // Debug print all task IDs
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: task_ids: ");
+        for (int id : task_ids) {
+            fprintf(stderr, "%d ", id);
+        }
+        fprintf(stderr, "\n");
+        
         ctx_server.receive_multi_results(task_ids, [&](std::vector<server_task_result_ptr> & results) {
+            fprintf(stderr, "[RERANK_DEBUG] handle_rerank: received %zu results\n", results.size());
             for (auto & res : results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
+                fprintf(stderr, "[RERANK_DEBUG] handle_rerank: processing result for task_id=%d\n", res->id);
+                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+                auto rerank_res = dynamic_cast<server_task_result_rerank*>(res.get());
+                fprintf(stderr, "[RERANK_DEBUG] handle_rerank: result score=%f, n_tokens=%d\n", 
+                       rerank_res->score, rerank_res->n_tokens);
                 responses.push_back(res->to_json());
             }
         }, [&](const json & error_data) {
+            fprintf(stderr, "[RERANK_DEBUG] handle_rerank: error occurred in receive_multi_results\n");
             res_error(res, error_data);
             error = true;
         }, req.is_connection_closed);
@@ -4518,7 +4665,9 @@ int main(int argc, char ** argv) {
         json root = oaicompat == OAICOMPAT_TYPE_EMBEDDING
             ? format_embeddings_response_oaicompat(body, responses, use_base64)
             : json(responses);
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: sending response to client\n");
         res_ok(res, root);
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: response sent successfully\n");
     };
 
     const auto handle_embeddings = [&handle_embeddings_impl](const httplib::Request & req, httplib::Response & res) {
@@ -4530,7 +4679,10 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_rerank = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: received request at %lld\n", (long long)time(NULL));
+        
         if (!ctx_server.params_base.reranking || ctx_server.params_base.embedding) {
+            fprintf(stderr, "[RERANK_DEBUG] handle_rerank: server not configured for reranking\n");
             res_error(res, format_error_response("This server does not support reranking. Start it with `--reranking` and without `--embedding`", ERROR_TYPE_NOT_SUPPORTED));
             return;
         }
@@ -4594,12 +4746,27 @@ int main(int argc, char ** argv) {
             ctx_server.queue_tasks.post(std::move(tasks));
         }
 
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: calling receive_multi_results with %zu task_ids\n", task_ids.size());
+        
+        // Debug print all task IDs
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: task_ids: ");
+        for (int id : task_ids) {
+            fprintf(stderr, "%d ", id);
+        }
+        fprintf(stderr, "\n");
+        
         ctx_server.receive_multi_results(task_ids, [&](std::vector<server_task_result_ptr> & results) {
+            fprintf(stderr, "[RERANK_DEBUG] handle_rerank: received %zu results\n", results.size());
             for (auto & res : results) {
+                fprintf(stderr, "[RERANK_DEBUG] handle_rerank: processing result for task_id=%d\n", res->id);
                 GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+                auto rerank_res = dynamic_cast<server_task_result_rerank*>(res.get());
+                fprintf(stderr, "[RERANK_DEBUG] handle_rerank: result score=%f, n_tokens=%d\n", 
+                       rerank_res->score, rerank_res->n_tokens);
                 responses.push_back(res->to_json());
             }
         }, [&](const json & error_data) {
+            fprintf(stderr, "[RERANK_DEBUG] handle_rerank: error occurred in receive_multi_results\n");
             res_error(res, error_data);
             error = true;
         }, req.is_connection_closed);
@@ -4609,6 +4776,7 @@ int main(int argc, char ** argv) {
         }
 
         // write JSON response
+        fprintf(stderr, "[RERANK_DEBUG] handle_rerank: formatting final response with %zu results\n", responses.size());
         json root = format_response_rerank(
             body,
             responses,
