@@ -1900,10 +1900,8 @@ struct server_response {
         }
         fprintf(stderr, "\n");
         
-        bool found = false;
         for (const auto & id_task : waiting_task_ids) {
             if (result->id == id_task) {
-                found = true;
                 SRV_DBG("task id = %d pushed to result queue\n", result->id);
                 
                 if (dynamic_cast<server_task_result_rerank*>(result.get()) != nullptr) {
